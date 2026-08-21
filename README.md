@@ -32,8 +32,12 @@ is the part people rebuild badly in spreadsheets.
 
 References are compared digit-only, so `INV-2026-0142`, `RE 2026/0142` and a
 bare `0142` all match the same invoice. Amounts are handled in cents, and both
-`1.234,56` and `1,234.56` parse correctly — mixing European and US exports in
-the same folder is normal and does not break anything.
+`1.234,56` and `1,234.56` parse correctly.
+
+Dates are read per file, not per row: the whole column is scanned first, so
+`09/01/2026` is September in a US export and 9 January in a European one.
+Guessing row by row is how an invoice that is not due yet shows up as 224 days
+overdue.
 
 A shortfall under €25 (or 2%) is reported as a **fee**, not a dispute. Chasing a
 client over an €11.50 wire charge is how you lose them.
@@ -71,6 +75,26 @@ The sample statement contains the awkward cases on purpose: a bank fee, a part
 payment, one transfer covering two invoices, two instalments covering one, a
 genuine double charge, an unidentified refund, and outgoing card payments that
 must be ignored.
+
+`samples/bank_us.csv` + `samples/invoices_us.csv` are the same exercise in the
+other dialect — comma separated, `MM/DD/YYYY`, `Credit`/`Debit` columns,
+`Doc No` instead of `InvoiceNumber` — to show the column matching and the date
+detection doing their job:
+
+```console
+$ python reconcile.py samples/bank_us.csv samples/invoices_us.csv
+
+Payments 4/5 matched   Invoices 3/4 settled
+Money in 5,710.00   matched 5,490.00   still owed 1,180.00
+
+Money received, no invoice found
+  row 7 2026-08-07     220.00 USD   ACH DEPOSIT UNKNOWN SENDER
+
+Open but not yet due: 1 invoice(s), 1,180.00
+```
+
+A part payment that a later transfer covers disappears from the exception list
+on its own — only what is still open gets reported.
 
 ## Output for the accountant
 
@@ -120,8 +144,8 @@ INV-2026-0142;Meridian Logistics;2026-07-20;2026-08-03;1200,00;EUR
 - Read-only by design: it reads two CSVs and writes a report. It never touches
   your accounting system.
 
-`python reconcile.py --selftest` runs 19 checks covering every pass, the amount
-parsers and the overdue maths.
+`python reconcile.py --selftest` runs 24 checks covering every pass, the amount
+and date parsers, the settled-later case and the overdue maths.
 
 ## License
 

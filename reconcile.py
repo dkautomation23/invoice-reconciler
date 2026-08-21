@@ -24,12 +24,11 @@ from datetime import date, datetime
 from itertools import combinations
 from pathlib import Path
 
-# Invoice references as they appear in payment descriptions: INV-2026-0142,
-# RE 2026/0142, FV/2026/142, 2026-0142.
+# Anything that could be an invoice reference inside a payment description:
+# INV-2026-0142, RE 2026/0142, FV/2026/142, 2026-0142, a bare 0142.
 REFERENCE_CHUNK = re.compile(r"[A-Za-z]{0,6}[-/ ]?\d[\d\-/ ]{2,}")
 YEAR_RE = re.compile(r"^(19|20)\d{2}$")
 WORD_RE = re.compile(r"[a-z0-9]+")
-DATE_FORMATS = ("%Y-%m-%d", "%d.%m.%Y", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d")
 
 # A shortfall this small is almost always a transfer fee, not a dispute.
 FEE_TOLERANCE_ABS = 25.0
@@ -61,9 +60,36 @@ def parse_amount(raw) -> int:
     return -value if negative else value
 
 
-def parse_date(raw) -> date | None:
+SLASHED_RE = re.compile(r"^(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})$")
+
+
+def detect_date_order(values) -> str:
+    """Decide whether a column is day-first or month-first, using the column.
+
+    03/04/2026 is ambiguous on its own; 13/04/2026 anywhere in the same file is
+    not. Guessing per row is how a July invoice ends up 224 days overdue.
+    """
+    day_first = month_first = 0
+    for value in values:
+        match = SLASHED_RE.match(str(value or "").strip()[:10])
+        if not match:
+            continue
+        first, second = int(match.group(1)), int(match.group(2))
+        if first > 12 >= second:
+            day_first += 1
+        elif second > 12 >= first:
+            month_first += 1
+    if month_first > day_first:
+        return "mdy"
+    return "dmy"                     # the European default, and the ISO tie-break
+
+
+def parse_date(raw, order: str = "dmy") -> date | None:
     text = str(raw or "").strip()[:10]
-    for fmt in DATE_FORMATS:
+    if not text:
+        return None
+    ordered = ("%m/%d/%Y", "%m-%d-%Y") if order == "mdy" else ("%d/%m/%Y", "%d-%m-%Y")
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d.%m.%Y", *ordered):
         try:
             return datetime.strptime(text, fmt).date()
         except ValueError:
@@ -160,13 +186,15 @@ def column(row: dict, *names: str) -> str:
 
 def load_payments(path: Path) -> list[Payment]:
     payments = []
-    for index, row in enumerate(read_rows(path), start=2):
+    rows = read_rows(path)
+    order = detect_date_order(column(row, "date", "booked", "datum") for row in rows)
+    for index, row in enumerate(rows, start=2):
         amount = parse_amount(column(row, "amount", "credit", "value", "betrag", "sum"))
         if amount <= 0:
             continue                      # outgoing lines are not customer payments
         payments.append(Payment(
             row=index,
-            date=parse_date(column(row, "date", "booked", "datum")),
+            date=parse_date(column(row, "date", "booked", "datum"), order),
             description=column(row, "description", "reference", "details", "purpose", "narrative", "text"),
             amount=amount,
             currency=column(row, "currency", "ccy").upper(),
@@ -176,7 +204,13 @@ def load_payments(path: Path) -> list[Payment]:
 
 def load_invoices(path: Path) -> list[Invoice]:
     invoices = []
-    for index, row in enumerate(read_rows(path), start=2):
+    rows = read_rows(path)
+    # Both date columns come from the same system, so they share one convention.
+    order = detect_date_order(
+        [column(row, "due", "fällig", "faellig") for row in rows]
+        + [column(row, "issue", "date", "datum") for row in rows]
+    )
+    for index, row in enumerate(rows, start=2):
         number = column(row, "invoice", "number", "nummer", "doc").strip()
         amount = parse_amount(column(row, "amount", "total", "gross", "betrag"))
         if not number or amount <= 0:
@@ -185,8 +219,8 @@ def load_invoices(path: Path) -> list[Invoice]:
             row=index,
             number=number,
             customer=column(row, "customer", "client", "name", "kunde", "payer"),
-            issue_date=parse_date(column(row, "issue", "date", "datum")),
-            due_date=parse_date(column(row, "due", "fällig", "faellig")),
+            issue_date=parse_date(column(row, "issue", "date", "datum"), order),
+            due_date=parse_date(column(row, "due", "fällig", "faellig"), order),
             amount=amount,
             currency=column(row, "currency", "ccy").upper(),
         ))
@@ -368,8 +402,11 @@ def print_report(report: dict) -> None:
         print(f"\nMatched across several lines: {len(combined)} bank entries settling "
               f"{len({m['invoice'] for m in combined})} invoice(s)")
 
+    # A shortfall that a later transfer covered is history, not an open item.
+    still_open = {item["invoice"] for item in report["outstanding"]}
     problems = [m for m in report["matches"]
-                if m["type"] not in {"exact", "amount_and_name", "batch_payment", "instalment"}]
+                if m["type"] not in {"exact", "amount_and_name", "batch_payment", "instalment"}
+                and (m["type"] == "overpaid" or m["invoice"] in still_open)]
     if problems:
         print("\nNeeds a decision")
         for match in problems:
@@ -407,9 +444,12 @@ def print_report(report: dict) -> None:
 def write_exceptions_csv(report: dict, path: Path) -> None:
     """One flat file with everything a human still has to handle."""
     rows = []
+    still_open = {item["invoice"] for item in report["outstanding"]}
     for match in report["matches"]:
         if match["type"] in {"exact", "amount_and_name", "batch_payment", "instalment"}:
             continue
+        if match["type"] != "overpaid" and match["invoice"] not in still_open:
+            continue                      # settled later by another payment
         rows.append({"issue": match["type"], "invoice": match["invoice"], "customer": match["customer"],
                      "amount": f"{match['amount'] / CENT:.2f}", "detail": match["note"]})
     for item in report["duplicates"]:
@@ -456,6 +496,12 @@ def selftest() -> int:
     check("amount parser: negative", parse_amount("-89.00") == -8900)
     check("amount parser: junk", parse_amount("n/a") == 0)
     check("date parser handles dotted dates", parse_date("05.08.2026") == date(2026, 8, 5))
+    check("column with a >12 day reads as day-first",
+          detect_date_order(["13/04/2026", "09/01/2026"]) == "dmy")
+    check("column with a >12 month position reads as month-first",
+          detect_date_order(["07/28/2026", "09/01/2026"]) == "mdy")
+    check("US column parses 09/01 as September",
+          parse_date("09/01/2026", detect_date_order(["07/28/2026", "09/01/2026"])) == date(2026, 9, 1))
 
     report = reconcile([payment(2, "Payment INV-2026-0142 Meridian", "1200.00")],
                        [invoice(2, "INV-2026-0142", "Meridian Logistics", "1200.00")],
@@ -492,6 +538,13 @@ def selftest() -> int:
                        [invoice(2, "INV-9", "Kestrel Design", "500.00")],
                        today=date(2026, 8, 20))
     check("pass 5 joins instalments", report["totals"]["invoices_settled"] == 1)
+
+    report = reconcile([payment(2, "INV-2026-0160 first transfer", "1500.00", "2026-08-03"),
+                        payment(3, "INV-2026-0160 balance", "1000.00", "2026-08-05")],
+                       [invoice(2, "INV-2026-0160", "Harbor & Co", "2500.00")],
+                       today=date(2026, 8, 20))
+    check("a shortfall covered later settles the invoice", report["totals"]["invoices_settled"] == 1)
+    check("nothing is left owing on it", report["totals"]["money_outstanding"] == 0)
 
     report = reconcile([payment(2, "Consulting fee ACME", "400.00"),
                         payment(3, "Consulting fee ACME", "400.00")],
