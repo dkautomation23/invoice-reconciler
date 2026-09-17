@@ -1,5 +1,7 @@
 # invoice-reconciler
 
+[![CI](https://github.com/dkautomation23/invoice-reconciler/actions/workflows/ci.yml/badge.svg)](https://github.com/dkautomation23/invoice-reconciler/actions/workflows/ci.yml)
+
 Matches a bank statement against your open invoices and tells you the only
 thing that matters: **what still does not add up.** Short payments, duplicate
 transfers, money with no invoice attached, invoices quietly going overdue.
