@@ -111,7 +111,7 @@ The exit code is `1` when unresolved items exist and `0` when the month is
 clean, so it slots into a nightly job:
 
 ```bash
-python reconcile.py bank.csv invoices.csv --csv exceptions.csv || mail -s "Reconciliation exceptions" me@company.com < exceptions.csv
+python reconcile.py bank.csv invoices.csv --csv exceptions.csv || mail -s "Reconciliation exceptions" me@example.com < exceptions.csv
 ```
 
 ## Input format
